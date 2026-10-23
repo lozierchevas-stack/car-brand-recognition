@@ -1,0 +1,139 @@
+# =====================================================================
+# 汽车品牌识别系统 - 全局配置
+# 层级: 项目基础 / 数据 / 模型 / 训练 / 导出 / 检索 / 边缘端 / MQTT / OTA / 硬件 / 难例
+# 敏感信息请通过环境变量注入: CAR_RECOG_ONENET_KEY / CAR_RECOG_MQTT_PASSWORD
+# =====================================================================
+
+project:
+  name: car-brand-recognition
+  seed: 42
+  log_level: INFO
+
+paths:
+  data_root: data
+  raw_root: data/raw               # Stanford Cars 原始下载目录
+  cropped_root: data/cropped       # GT 边界框裁剪后的规范归档
+  artifacts_dir: artifacts
+  hard_case_dir: data/hard_cases   # 难例采集目录
+  ota_dir: data/ota_inbox          # OTA 增量包监听目录
+
+dataset:
+  name: stanford-cars
+  image_size: 224
+  val_fraction: 0.0                # >0 时从训练集切分带框验证集; 0 使用官方 test 集(无框)
+  num_workers: 4
+
+model:
+  backbone: mobilenet_v3_large     # mobilenet_v3_large | mobilenet_v3_small
+  embedding_dim: 512
+  pretrained: true
+  dropout: 0.0
+
+train:
+  # 注意: batch_size = P*K 不宜过小 (建议 >= 64)。小 batch 下 BN 的 batch 统计
+  # 会"白化"整个小批次, 模型会学会依赖 batch 统计而非真实特征, 推理侧将塌缩。
+  p: 16                            # P-K 采样: 每批品牌数
+  k: 4                             # P-K 采样: 每品牌样本数 (batch_size = P*K)
+  epochs: 60
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 0.0005
+  warmup_epochs: 5
+  amp: true                        # AMP 混合精度 (CUDA 可用时自动生效)
+  loss:
+    type: arcface                  # arcface | cosface | softmax
+    s: 32.0
+    m: 0.5
+    easy_margin: false
+    label_smoothing: 0.0
+  aug:
+    color_jitter: [0.25, 0.25, 0.2, 0.05]
+    night_p: 0.3                   # 夜间模拟概率
+    occlusion_p: 0.35              # 局部遮挡概率
+    random_erasing_p: 0.0
+  eval_every: 1
+  val_limit: 800                   # 每次验证最多评估图像数 (CPU 友好)
+  checkpoint_dir: artifacts/checkpoints
+
+export:
+  onnx_path: artifacts/models/embedding.onnx
+  opset: 17
+  dynamic_batch: true
+  normalize_output: true           # 输出 L2 归一化特征 (内积=余弦)
+
+trt:
+  engine_path: artifacts/models/embedding.engine
+  fp16: true
+  workspace_gb: 2
+  min_batch: 1
+  opt_batch: 1
+  max_batch: 16
+
+retrieval:
+  dim: 512
+  index_dir: artifacts/retrieval_make
+  min_sim: 0.55                    # 双重阈值之一: top1 余弦相似度下限 (低于则判未知)
+  margin: 0.15                     # 双重阈值之二: top1 与跨品牌最佳相似度差下限 (低于则判模棱两可)
+  topk: 5
+  critical_band: 0.05              # [min_sim, min_sim+band) 为临界置信带 -> 难例采集
+  # 阈值定标 (2026-10-14, 验证集 788 张, 报告见 artifacts/calibration_report.html):
+  #   道闸场景 (默认): min_sim=0.55 / margin=0.15 -> 精度 0.965, 覆盖 0.693, 10:1 加权成本 377
+  #   平衡场景:       min_sim=0.47 / margin=0.05 -> 精度 0.914, 覆盖 0.883
+  #   旧默认 0.55/0.10: 精度 0.951, 覆盖 0.775, 10:1 加权成本 422
+
+edge:
+  source: 0                        # 0=默认摄像头; rtsp://...; 或本地视频文件路径
+  stride: 5                        # 抽帧间隔 (每 5 帧提取一次特征)
+  queue_size: 4                    # 帧队列深度 (满则丢最旧, 防卡顿)
+  embedder: artifacts/models/embedding_make.onnx
+  engine: artifacts/models/embedding_make.engine   # TensorRT 引擎路径 (存在且依赖可用时优先)
+  display: true
+  whitelist: ["Acura"]   # 白名单品牌(品牌级), 命中则联动硬件 (如道闸抬杆)
+  action_on_accept: gate_open
+  gate_cooldown_s: 5.0             # 硬件联动冷却, 防止重复触发
+  gate_duration_ms: 3000
+  detection:
+    enabled: true                 # 可选: YOLOv8 车辆检测 (先检 ROI 再识别, 多车同框场景; 固定单车机位用整帧)
+    model_path: artifacts/models/yolov8n_vehicle.onnx
+    conf_thres: 0.35
+    iou_thres: 0.45
+    classes: [2, 5, 7]             # COCO: car / bus / truck
+
+mqtt:
+  enabled: true
+  host: 127.0.0.1                  # OneNET MQTT 接入地址 (或自建 Broker)
+  port: 1883
+  tls: false
+  keepalive: 60
+  client_id: ""                    # 标准 Broker 模式下的 client_id (留空自动生成)
+  username: ""                     # 标准 Broker 模式用户名
+  password: ""                     # 标准 Broker 模式密码 (或环境变量注入)
+  outbox_size: 512                 # 离线消息缓冲上限
+  onenet:                          # OneNET 模式: product_id 与 device_name 均非空时启用
+    product_id: ""
+    device_name: ""
+    access_key: ""                 # 建议环境变量 CAR_RECOG_ONENET_KEY 注入
+    token_ttl: 86400               # 鉴权 token 有效期 (秒)
+  topics:                          # 留空时使用 OneNET 默认主题 / 标准 Broker 默认主题
+    result: ""
+    hardcase: ""
+    ota: ""
+    command: ""
+
+ota:
+  enabled: true
+  poll_interval_s: 5.0             # ota_dir 轮询间隔
+
+hardware:
+  mode: simulate                   # simulate | serial
+  serial:
+    port: COM3
+    baudrate: 115200
+    timeout: 2.0
+
+hard_case:
+  enabled: true
+  save_image: true
+  publish_mqtt: true
+  max_queue: 256
+  jpeg_quality: 92
